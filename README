@@ -1,3 +1,130 @@
+# Advanced Topic in Operating Systems
+
+This repo contains solutions for Advanced Topics in Operating System course at MIMUW
+http://students.mimuw.edu.pl/ZSO/PUBLIC-SO/2017-2018/_build/html/z2_driver/index-en.html
+
+### Introduction
+
+The task is to write a driver for [the HardDoom™ device](harddoom.html#z2-harddoom), which is a graphics accelerator designed for Doom. The device is delivered in the form of a [modified version of qemu](#z2-qemu-en).
+
+The device should be available to the user in the form of a character device. For each HardDoom™ device present in the system, create a `/dev/doomX` character device, where X is the index of the HardDoom™ device, starting with 0.
+
+### Character device interface
+
+The device `/dev/doom*` is used only to create HardDoom™ resources – all the proper operations will be performed on the created resources. It should support the following operations:
+
+ * `open`: obviously.
+ * `close`: obviously.
+ * `ioctl(DOOMDEV_IOCTL_CREATE_SURFACE)`: creates a new frame buffer on the device. As a parameter of this call, the dimensions of the buffer (width and height) are transmitted. The width must be a multiple of 64 in the range 64 … 2048 and the height must be in the range 1 … 2048. The result of this call is a new file descriptor referring to the created buffer. The buffer created has undefined content.
+ * `ioctl(DOOMDEV_IOCTL_CREATE_TEXTURE)`: creates a new column texture on the device. Parameters of this call are texture size in bytes (maximum 4MiB), texture height in texels (maximum 1023, or 0, if the texture is not to be repeated vertically), and an pointer to the texture data. The result is a file descriptor referring to the texture created.
+ * `ioctl(DOOMDEV_IOCTL_CREATE_FLAT)`: creates a new flat texture on the device. The parameter for this call is the data pointer (`0x1000` bytes). The result is a file descriptor referring to the texture created.
+ * `ioctl(DOOMDEV_IOCTL_CREATE_COLORMAPS)`: creates a new array of color maps on the device. The parameters of this call are the size of the array (number of color maps) and the pointer to data (each color map is `0x100` bytes). The result is a file descriptor referring to the created array. The maximum allowable size for the array is `0x100` maps.
+
+Textures and color map arrays do not support any standard operations except `close` (which, if all other references have already been released, releases their memory) – they can only be used as parameters for drawing calls. It is also impossible to change their content in any way after creation.
+
+All pointers are passed as `uint64_t` so that the structures have the same layout in 64-bit mode as in 32-bit mode, avoiding the need to define corresponding `_compat` structures. For the same reason, many structures have unused `_pad` fields.
+
+The following operations can be called on the frame buffers:
+
+ * `ioctl (DOOMDEV_SURF_IOCTL_COPY_RECT)`: performs a series of `COPY_RECT` operations to a given buffer. Parameters are:
+    * `surf_src_fd`: file descriptor pointing to the frame buffer from which the copy should be made.
+    * `rects_ptr`: a pointer to an array of `doomdev_copy_rect` structures.
+    * `rects_num`: number of rectangles to copy.
+    * in the `doomdev_copy_rect` structures:
+        * `pos_dst_x`, `pos_dst_y` – coordinates of the target rectangle in the given buffer (top left corner).
+        * `pos_src_x`, `pos_src_y` – coordinates of the source rectangle in the source buffer.
+        * `width`, `height` – size of the rectangle to be copied.
+    
+    The semantics of this call are quite similar to `write`: the driver tries to perform as many operations as possible from the given list, stopping in case of error or signal arrival. If the first operation failed, the error code is returned. Otherwise, the number of completed operations is returned. The user code is responsible for retrying when incomplete.
+    
+    The user is responsible for ensuring that, within one `ioctl` call, no pixel is both written and read (ie, the command `INTERLOCK` between the rectangles will not be required). The driver does not have to detect such situations (but it can if it wants to) – sending commands to the device and obtaining an incorrect drawing result is acceptable in such a situation.
+    
+ * `ioctl(DOOMDEV_SURF_IOCTL_FILL_RECT)`: performs a series of `FILL_RECT` operations. Parameters:
+    * `rects_ptr`: a pointer to an array of `doomdev_fill_rect` structures.
+    * `rects_num`: number of rectangles to fill.
+    * in the `doomdev_fill_rect` structures:
+        * `pos_dst_x`, `pos_dst_y` – coordinates of the target rectangle in the given buffer.
+        * `width`, `height` – size of the rectangle to be filled.
+        * `color` – the fill color.
+    
+    The returned value is as in `DOOMDEV_SURF_IOCTL_COPY_RECT`.
+    
+* `ioctl(DOOMDEV_SURF_IOCTL_DRAW_LINE)`: performs a series of `DRAW_LINE` operations. Parameters:
+    * `lines_ptr`: a pointer to an array of `doomdev_line` structures.
+    * `lines_num`: number of lines to draw.
+    * in the `doomdev_line` structures:
+        * `pos_a_x`, `pos_a_y`: coordinates of the first endpoint of the line.
+        * `pos_b_x`, `pos_b_y`: coordinates of the second endpoint.
+        * `color` – the color of the line to be drawn.
+    
+    The returned value is as in `DOOMDEV_SURF_IOCTL_COPY_RECT`.
+    
+* `ioctl(DOOMDEV_SURF_IOCTL_DRAW_BACKGROUND)`: performs the `DRAW_BACKGROUND` operation. Parameters:
+    * `flat_fd`: a file descriptor pointing to a flat texture that will serve as the background.
+    
+    In case of a successful call, 0 is returned.
+    
+* `ioctl(DOOMDEV_SURF_IOCTL_DRAW_COLUMNS)`: performs a series of `DRAW_COLUMN` operations. Parameters:
+    * `draw_flags`: a combination of the following flags:
+        * `DOOMDEV_DRAW_FLAGS_FUZZ` – if set, the fuzz effect will be rendered – most parameters are ignored (including other flags).
+        * `DOOMDEV_DRAW_FLAGS_TRANSLATE` – if set, the palette will be remapped according to the translation color map.
+        * `DOOMDEV_DRAW_FLAGS_COLORMAP` – if set, colors will be dimmed according to the color map.
+    * `texture_fd`: a descriptor of the column texture (ignored if the `FUZZ` flag is set).
+    * `translation_fd`: a descriptor of the color map array used by the `TRANSLATE` flag (ignored, if the flag is not set).
+    * `colormap_fd`: a descriptor of the color map array used by the `COLORMAP` and `FUZZ` flags. Ignored, if none of these flags is set.
+    * `translation_idx`: index of the color map used by the `TRANSLATE` option. Used only, if the `TRANSLATE` flag is set.
+    * `columns_num`: number of columns to draw.
+    * `columns_ptr`: a pointer to an array of `doomdev_column` structures:
+        * `column_offset`: starting offset of this column in the texture.
+        * `ustart`: an unsigned fixed-point 16.16 number, must be in the range supported by the hardware. Ignored, if the `FUZZ` flag is used.
+        * `ustep`: an unsigned fixed-point 16.16 number, must be in the range supported by the hardware. Ignored, if the `FUZZ` flag is used.
+        * `x`: the `x` coordinate of the column.
+        * `y1`, `y2`: the `y` coordinates of the top and bottom pixels of the column.
+        * `colormap_idx`: index of the color map used by `FUZZ` and `COLORMAP` flags. Ignored, if neither of those is set.
+    
+    The returned value is as in `DOOMDEV_SURF_IOCTL_COPY_RECT`.
+    
+* `ioctl(DOOMDEV_SURF_IOCTL_DRAW_SPANS)`: performs a series of `DRAW_SPAN` operations. Parameters:
+    * `flat_fd`: a flat texture descriptor.
+    * `translation_fd`: like above.
+    * `colormap_fd`: like above.
+    * `draw_flags`: like above, but without the `FUZZ` flag.
+    * `translation_idx`: like above.
+    * `spans_num`: number of spans to draw.
+    * `spans_ptr` a pointer to an array of `doomdev_span` structures:
+        * `ustart`, `vstart`: like `ustart` above.
+        * `ustep`, `vstep`: like `ustep` above.
+        * `x1`, `x2`: the `x` coordinates of the leftmost and rightmost pixel of the span.
+        * `y`: the `y` coordinate of the span.
+        * `colormap_idx`: like above.
+    
+    The returned value is as in `DOOMDEV_SURF_IOCTL_COPY_RECT`.
+* `lseek`: sets the position in the buffer for subsequent `read` calls.
+    
+* `read`, `pread`, `readv`, etc: waits for completion of all previously submitted drawing operations for the given buffer, and then reads the finished data from the buffer to the user space. In case of an attempt to read outside of buffer bounds, end-of-file should be returned.
+    
+
+The driver should detect commands with incorrect parameters (wrong file type passed as `*_fd`, coordinates extending beyond the frame buffer, etc.) and return the error `EINVAL`. If the user tries to create textures or frame buffers larger than those supported by the hardware, `EOVERFLOW` should be returned.
+
+The driver should register its devices in sysfs so that udev automatically creates device files with appropriate names in `/dev`. The major and minor numbers for these devices are arbitrary (majors should be allocated dynamically).
+
+A header file with the appropriate definitions can be found here: [https://github.com/koriakin/prboom-plus/blob/doomdev/src/doomdev.h](https://github.com/koriakin/prboom-plus/blob/doomdev/src/doomdev.h)
+
+The driver can assume a limit of 256 devices in the system.
+
+### Assumptions for interaction with hardware
+
+It can be assumed that before the driver is loaded, the device has a state like a hardware reset. The device should also be left in this state when the driver is unloaded.
+
+A fully-scored solution should work asynchronously – drawing `ioctl` operations should send commands to the device and return to the user space without waiting for completion (but if the command buffers are already full, it is acceptable to wait for free space to become available). Waiting for the end of the command should only be done when calling `read` which will actually need the drawing results.
+
+
+
+
+-----------------------------------
+
+
+
         Linux kernel release 4.x <http://kernel.org/>
 
 These are the release notes for Linux version 4.  Read them carefully,

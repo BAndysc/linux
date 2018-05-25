@@ -1,0 +1,5 @@
+TARGET = harddoom
+
+ccflags-y := -std=gnu99 -Wall -Wno-declaration-after-statement -fdiagnostics-color=always
+harddoom-objs := doom_pagetable.o doom_driver.o doom_surface.o doom_render.o doom_texture.o doom_queue.o doom_ioctl.o
+obj-m	:= harddoom.o 
